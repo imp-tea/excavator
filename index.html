@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Track Excavator Physics Lab</title>
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="scene" aria-label="Tank tread physics simulation"></canvas>
+      <aside class="panel" aria-label="Simulation controls">
+        <div class="panel__header">
+          <h1>Track Excavator</h1>
+          <div class="status" id="status">idle</div>
+        </div>
+        <div class="meter">
+          <div class="meter__label">
+            <span>Drive</span>
+            <strong id="driveReadout">0%</strong>
+          </div>
+          <div class="meter__bar"><span id="driveBar"></span></div>
+        </div>
+        <div class="controls" id="controls"></div>
+        <div class="buttons">
+          <button id="resetButton" type="button" title="Reset simulation" aria-label="Reset simulation">Reset</button>
+          <button id="pauseButton" type="button" title="Pause simulation" aria-label="Pause simulation">Pause</button>
+        </div>
+      </aside>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
