@@ -78,8 +78,11 @@ const settings = {
   chassisMass: 2,
   gravity: 18,
   armSpeed: 1.5,
-  scoopSize: 0.7,
 };
+
+const gamepadDeadzone = 0.14;
+const directTargetSpeed = 4.1;
+const directHeadTurnSpeed = 1.35;
 
 const sliderSpecs = [
   ['speed', 'Drive speed', 4, 24, 0.5],
@@ -91,10 +94,30 @@ const sliderSpecs = [
   ['chassisMass', 'Chassis mass', 0.45, 2.4, 0.05],
   ['gravity', 'Gravity', 8, 28, 0.5],
   ['armSpeed', 'Arm speed', 1.5, 9, 0.1],
-  ['scoopSize', 'Scoop size', 0.2, 1.2, 0.05],
 ];
 
 const keys = new Set();
+const pointerControl = {
+  active: false,
+  lastX: 0,
+  lastY: 0,
+  deltaLocal: Vec2(0, 0),
+  lastInputAt: 0,
+};
+const joypad = {
+  supported: typeof navigator !== 'undefined' && typeof navigator.getGamepads === 'function',
+  connected: false,
+  index: null,
+  id: '',
+  drive: 0,
+  armX: 0,
+  armY: 0,
+  headTurn: 0,
+  jawOpen: false,
+  lastAButton: false,
+  active: false,
+  lastInputAt: 0,
+};
 let world;
 let tank;
 let props = [];
@@ -105,7 +128,6 @@ let lastTime = performance.now();
 let accumulator = 0;
 let paused = false;
 let resetQueued = false;
-let lastRightPointerAt = 0;
 
 setupControls();
 buildWorld();
@@ -115,11 +137,15 @@ requestAnimationFrame(frame);
 window.addEventListener('resize', resize);
 window.addEventListener('keydown', (event) => {
   if (event.repeat) return;
-  if (event.code === 'KeyA' || event.code === 'KeyD') {
+  if (event.code === 'KeyA' || event.code === 'KeyD' || event.code === 'KeyQ' || event.code === 'KeyE' || event.code === 'ShiftLeft' || event.code === 'ShiftRight') {
     keys.add(event.code);
     event.preventDefault();
   }
   if (event.code === 'Space') {
+    joypad.jawOpen = !joypad.jawOpen;
+    event.preventDefault();
+  }
+  if (event.code === 'KeyP') {
     paused = !paused;
     updatePauseButton();
     event.preventDefault();
@@ -128,21 +154,63 @@ window.addEventListener('keydown', (event) => {
 window.addEventListener('keyup', (event) => {
   keys.delete(event.code);
 });
+
 canvas.addEventListener('pointerdown', (event) => {
-  if (event.button !== 0 && event.button !== 2) return;
-  event.preventDefault();
-  const point = screenToWorld(event.clientX, event.clientY);
-  if (event.button === 2) {
-    lastRightPointerAt = performance.now();
-    commandArm('dump', point);
-  } else {
-    commandArm('scoop', point);
+  if (event.button === 0) {
+    joypad.jawOpen = !joypad.jawOpen;
+    event.preventDefault();
+    return;
   }
+
+  if (event.button !== 2) return;
+  pointerControl.active = true;
+  pointerControl.lastX = event.clientX;
+  pointerControl.lastY = event.clientY;
+  pointerControl.lastInputAt = performance.now();
+  canvas.setPointerCapture?.(event.pointerId);
+  event.preventDefault();
 });
+canvas.addEventListener('pointermove', (event) => {
+  if (!pointerControl.active) return;
+  const dx = event.clientX - pointerControl.lastX;
+  const dy = event.clientY - pointerControl.lastY;
+  pointerControl.lastX = event.clientX;
+  pointerControl.lastY = event.clientY;
+
+  const precision = isPrecisionMode() ? 0.35 : 1;
+  const worldDelta = Vec2((dx / camera.zoom) * precision, (-dy / camera.zoom) * precision);
+  const localDelta = rotateVec(worldDelta, -tank.chassis.getAngle());
+  pointerControl.deltaLocal = Vec2(
+    pointerControl.deltaLocal.x + localDelta.x,
+    pointerControl.deltaLocal.y + localDelta.y,
+  );
+  pointerControl.lastInputAt = performance.now();
+  event.preventDefault();
+});
+canvas.addEventListener('pointerup', endPointerControl);
+canvas.addEventListener('pointercancel', endPointerControl);
 canvas.addEventListener('contextmenu', (event) => {
   event.preventDefault();
-  if (performance.now() - lastRightPointerAt > 250) {
-    commandArm('dump', screenToWorld(event.clientX, event.clientY));
+});
+
+window.addEventListener('gamepadconnected', (event) => {
+  joypad.index = event.gamepad.index;
+  joypad.id = event.gamepad.id || 'Gamepad';
+  joypad.connected = true;
+  updateHud();
+});
+window.addEventListener('gamepaddisconnected', (event) => {
+  if (joypad.index === event.gamepad.index) {
+    joypad.connected = false;
+    joypad.index = null;
+    joypad.id = '';
+    joypad.drive = 0;
+    joypad.armX = 0;
+    joypad.armY = 0;
+    joypad.headTurn = 0;
+    joypad.active = false;
+    joypad.lastAButton = false;
+    updateHud();
   }
 });
 resetButton.addEventListener('click', () => {
@@ -201,7 +269,7 @@ function setupControls() {
 
 function formatSetting(key) {
   const value = settings[key];
-  if (key === 'damping' || key === 'chassisMass' || key === 'scoopSize') return value.toFixed(2);
+  if (key === 'damping' || key === 'chassisMass') return value.toFixed(2);
   if (key === 'wheelFriction' || key === 'suspension' || key === 'gravity' || key === 'speed' || key === 'armSpeed') {
     return value.toFixed(1);
   }
@@ -416,13 +484,11 @@ function createExcavatorArm(chassis) {
       headAngle: 260,
       jawAngle: 180,
     },
-    load: 0,
-    state: 'ready',
-    action: null,
+    state: joypad.supported ? 'connect pad' : 'keyboard',
     targetWorld: null,
-    targetFlash: 0,
-    restTipLocal: Vec2(6.4, 2.45),
-    restHeadAbs: -0.65,
+    directTargetLocal: null,
+    desiredHeadAbs: null,
+    directLimit: false,
     targetPose,
   };
 
@@ -463,6 +529,10 @@ function createExcavatorArm(chassis) {
   };
 
   arm.workspaceSample = sampleArmWorkspace(arm, 0.05);
+  arm.workspaceBounds = getWorkspaceBounds(arm.workspaceSample);
+  arm.directTargetLocal = Vec2(initialPoints.wrist.x, initialPoints.wrist.y);
+  arm.desiredHeadAbs = initialPoints.headAbs;
+  arm.targetWorld = chassis.getWorldPoint(arm.directTargetLocal);
 
   return arm;
 }
@@ -649,169 +719,150 @@ function applyLiveSettings(key) {
   }
 }
 
-function commandArm(kind, targetWorld) {
-  if (!tank?.arm) return;
-  const arm = tank.arm;
-  const action = kind === 'dump' ? createDumpAction(targetWorld) : createScoopAction(targetWorld);
-
-  if (!isActionReachable(arm, action)) {
-    arm.action = null;
-    arm.state = 'out of range';
-    arm.targetWorld = targetWorld;
-    arm.targetFlash = 1;
-    updateHud();
-    return;
-  }
-
-  arm.action = action;
-
-  arm.targetWorld = targetWorld;
-  arm.targetFlash = 1;
-  arm.state = kind;
-  updateHud();
-}
-
-function createScoopAction(targetWorld) {
-  return {
-    kind: 'scoop',
-    index: 0,
-    hold: 0,
-    phases: [
-      { state: 'reach', world: offsetVec(targetWorld, -0.45, 1.35), headWorld: -0.62, jawAngle: jawOpenAngle, tolerance: 0.16, tipTolerance: 0.7 },
-      { state: 'lower', world: offsetVec(targetWorld, -0.18, 0.42), headWorld: -0.7, jawAngle: jawOpenAngle, tolerance: 0.16, tipTolerance: 0.72 },
-      { state: 'bite', world: offsetVec(targetWorld, 0.12, 0.28), headWorld: -0.5, jawAngle: jawClosedAngle, tolerance: 0.22, tipTolerance: 0.82, hold: 0.18, capture: true },
-      { state: 'lift', world: offsetVec(targetWorld, -0.02, 1.42), headWorld: -0.42, jawAngle: jawClosedAngle, tolerance: 0.16, tipTolerance: 0.72 },
-      { state: 'stow arm', restPose: 'stickCurl', tolerance: 0.14 },
-    ],
-  };
-}
-
-function createDumpAction(targetWorld) {
-  return {
-    kind: 'dump',
-    index: 0,
-    hold: 0,
-    phases: [
-      { state: 'carry', world: offsetVec(targetWorld, -0.05, 1.2), headWorld: -0.36, jawAngle: jawClosedAngle, tolerance: 0.16, tipTolerance: 0.72 },
-      { state: 'place', world: offsetVec(targetWorld, 0.06, 0.62), headWorld: -0.42, jawAngle: jawClosedAngle, tolerance: 0.16, tipTolerance: 0.78 },
-      { state: 'release', world: offsetVec(targetWorld, 0.06, 0.74), headWorld: -0.48, jawAngle: jawOpenAngle, tolerance: 0.18, tipTolerance: 0.8, hold: 0.28, release: true },
-      { state: 'recover', world: offsetVec(targetWorld, -0.22, 1.36), headWorld: -0.64, jawAngle: jawOpenAngle, tolerance: 0.17, tipTolerance: 0.72 },
-      { state: 'stow arm', restPose: 'stickCurl', tolerance: 0.14 },
-    ],
-  };
-}
-
 function updateArm(dt) {
   const arm = tank.arm;
-  arm.targetFlash = Math.max(0, arm.targetFlash - dt * 1.8);
+  ensureDirectArmTarget(arm);
+  clampDesiredHeadAbsToCurrentPose(arm);
+  updateDirectHeadTarget(arm, dt);
 
-  let targetLocal = arm.restTipLocal;
-  let headLocal = arm.restHeadAbs;
-  let jawLocal = arm.targetPose.jawAngle;
-  const action = arm.action;
-  let phase = null;
+  const jawAngle = joypad.jawOpen ? arm.jawOpenAngle : arm.jawClosedAngle;
+  const blockedByInput = moveDirectArmTarget(arm, dt, jawAngle);
 
-  if (action) {
-    phase = action.phases[action.index];
-    arm.state = phase.state;
-    targetLocal = phase.rest ? arm.restTipLocal : phase.world ? tank.chassis.getLocalPoint(phase.world) : null;
-    headLocal = phase.rest ? arm.restHeadAbs : phase.headWorld != null ? worldAngleToChassisLocal(phase.headWorld) : null;
-    jawLocal = phase.jawAngle ?? jawLocal;
-
+  const solved = solveDirectArmPose(arm, arm.directTargetLocal, jawAngle);
+  if (solved) {
+    arm.targetPose = solved;
+    clampDesiredHeadAbsToPose(arm, arm.targetPose);
+    arm.directLimit = blockedByInput;
   } else {
-    arm.state = arm.targetFlash > 0 ? arm.state : 'ready';
-  }
-
-  if (phase?.restPose) {
-    arm.targetPose = getRestPoseTarget(arm, phase.restPose);
-  } else if (!action) {
-    arm.targetPose = getRestPoseTarget(arm, 'stickCurl');
-  } else {
-    const solved = findBestArmPose(arm, targetLocal, headLocal, {
-      jawAngle: jawLocal,
-      orientationSlack: action ? 0.22 : 0.35,
-      orientationWeight: action ? 1.35 : 0.8,
-    });
-
-    if (solved) {
-      arm.targetPose = solved;
-    } else if (action) {
-      arm.action = null;
-      arm.state = 'out of range';
-      driveArmJoints(arm, arm.targetPose);
-      return;
-    }
+    arm.targetPose = { ...arm.targetPose, jawAngle };
+    clampDesiredHeadAbsToCurrentPose(arm);
+    arm.directLimit = true;
   }
 
   driveArmJoints(arm, arm.targetPose);
-
-  if (!action) return;
-
-  const currentTipError = phase.restPose ? 0 : Vec2.distance(getArmLocalPoints(arm).tip, targetLocal);
-  const poseError = getPhasePoseError(arm, phase);
-
-  if (poseError < (phase.tolerance ?? 0.12) && currentTipError < (phase.tipTolerance ?? 0.32)) {
-    action.hold += dt;
-    if (action.hold >= (phase.hold ?? 0)) {
-      completeArmPhase(arm, phase);
-      action.index += 1;
-      action.hold = 0;
-      if (action.index >= action.phases.length) {
-        arm.action = null;
-        arm.state = 'ready';
-      }
-    }
-  } else {
-    action.hold = 0;
-  }
+  arm.targetWorld = arm.chassis.getWorldPoint(arm.directTargetLocal);
+  arm.state = getDirectArmState(arm);
 }
 
-function getRestPoseTarget(arm, restPose) {
-  const [, boomMax] = arm.limits.boomAngle;
-  const [stickMin] = arm.limits.stickAngle;
+function ensureDirectArmTarget(arm) {
+  if (arm.directTargetLocal && arm.desiredHeadAbs != null) return;
 
-  if (restPose === 'jawClose') {
-    return { ...arm.targetPose, jawAngle: arm.jawClosedAngle };
-  }
-
-  if (restPose === 'boomRaise') {
-    return { ...arm.targetPose, boomAngle: boomMax, headAngle: -0.46, jawAngle: arm.jawClosedAngle };
-  }
-
-  if (restPose === 'stickCurl') {
-    return { boomAngle: Math.min(boomMax, 1.48), stickAngle: Math.max(stickMin, -1.76), headAngle: -0.44, jawAngle: arm.jawClosedAngle };
-  }
-
-  return arm.targetPose;
+  const points = getArmLocalPoints(arm);
+  arm.directTargetLocal = Vec2(points.wrist.x, points.wrist.y);
+  arm.desiredHeadAbs = clampHeadAbsToPoseLimits(arm, points.headAbs, getArmJointAngles(arm));
+  arm.targetWorld = arm.chassis.getWorldPoint(arm.directTargetLocal);
 }
 
-function getPhasePoseError(arm, phase) {
-  const keys = phase.restPose
-    ? getRestPoseKeys(phase.restPose)
-    : ['boomAngle', 'stickAngle', 'headAngle', 'jawAngle'];
-  return Math.max(...keys.map((key) => angleDelta(arm.joints[key].getJointAngle(), arm.targetPose[key])));
+function updateDirectHeadTarget(arm, dt) {
+  const headTurn = getCombinedHeadTurn();
+  if (!headTurn) return;
+  arm.desiredHeadAbs = clampHeadAbsToPoseLimits(
+    arm,
+    normalizeAngle(arm.desiredHeadAbs + headTurn * directHeadTurnSpeed * getPrecisionScale() * dt),
+    getArmJointAngles(arm),
+  );
 }
 
-function getRestPoseKeys(restPose) {
-  if (restPose === 'jawClose') return ['jawAngle'];
-  if (restPose === 'boomRaise') return ['boomAngle', 'headAngle', 'jawAngle'];
-  if (restPose === 'stickCurl') return ['boomAngle', 'stickAngle', 'headAngle', 'jawAngle'];
-  return ['boomAngle', 'stickAngle', 'headAngle', 'jawAngle'];
+function moveDirectArmTarget(arm, dt, jawAngle) {
+  const stickMagnitude = Math.hypot(joypad.armX, joypad.armY);
+  const pointerDelta = pointerControl.deltaLocal;
+  pointerControl.deltaLocal = Vec2(0, 0);
+
+  if (stickMagnitude <= 0 && Math.hypot(pointerDelta.x, pointerDelta.y) <= 0) return false;
+
+  const scale = Math.min(1, stickMagnitude);
+  const worldDelta = Vec2(
+    stickMagnitude > 0 ? (joypad.armX / stickMagnitude) * scale * directTargetSpeed * getPrecisionScale() * dt : 0,
+    stickMagnitude > 0 ? (joypad.armY / stickMagnitude) * scale * directTargetSpeed * getPrecisionScale() * dt : 0,
+  );
+  const stickDelta = rotateVec(worldDelta, -tank.chassis.getAngle());
+  const dx = stickDelta.x + pointerDelta.x;
+  const dy = stickDelta.y + pointerDelta.y;
+  const current = arm.directTargetLocal;
+  const fullMove = Vec2(current.x + dx, current.y + dy);
+
+  if (trySetDirectArmTarget(arm, fullMove, jawAngle)) return false;
+
+  const xOnly = Vec2(current.x + dx, current.y);
+  const yOnly = Vec2(current.x, current.y + dy);
+  const first = Math.abs(dx) >= Math.abs(dy) ? xOnly : yOnly;
+  const second = first === xOnly ? yOnly : xOnly;
+
+  if (trySetDirectArmTarget(arm, first, jawAngle)) return false;
+  if (trySetDirectArmTarget(arm, second, jawAngle)) return false;
+
+  return true;
 }
 
-function completeArmPhase(arm, phase) {
-  if (phase.done) return;
-  phase.done = true;
-  const tipWorld = getArmWorldPoints(arm).tip;
+function trySetDirectArmTarget(arm, targetLocal, jawAngle) {
+  const clamped = clampArmTargetToWorkspace(arm, targetLocal);
+  const solved = solveDirectArmPose(arm, clamped, jawAngle);
+  if (!solved) return false;
+  arm.directTargetLocal = clamped;
+  arm.targetPose = solved;
+  clampDesiredHeadAbsToPose(arm, solved);
+  arm.directLimit = false;
+  return true;
+}
 
-  if (phase.capture) {
-    arm.load = Math.max(arm.load, settings.scoopSize);
-  }
+function clampDesiredHeadAbsToCurrentPose(arm) {
+  arm.desiredHeadAbs = clampHeadAbsToPoseLimits(arm, arm.desiredHeadAbs, getArmJointAngles(arm));
+}
 
-  if (phase.release) {
-    spawnSoil(tipWorld, arm.load || settings.scoopSize * 0.35);
-    arm.load = 0;
-  }
+function clampDesiredHeadAbsToPose(arm, pose) {
+  arm.desiredHeadAbs = clampHeadAbsToPoseLimits(arm, arm.desiredHeadAbs, pose);
+}
+
+function clampHeadAbsToPoseLimits(arm, targetHeadAbs, pose) {
+  const stickAbs = normalizeAngle(pose.boomAngle + pose.stickAngle);
+  const [headMin, headMax] = arm.limits.headAngle;
+  const localHead = clamp(normalizeAngle(targetHeadAbs - stickAbs), headMin, headMax);
+  return normalizeAngle(stickAbs + localHead);
+}
+
+function clampArmTargetToWorkspace(arm, targetLocal) {
+  const bounds = arm.workspaceBounds;
+  if (!bounds) return targetLocal;
+  return Vec2(
+    clamp(targetLocal.x, bounds.minX, bounds.maxX),
+    clamp(targetLocal.y, bounds.minY, bounds.maxY),
+  );
+}
+
+function solveDirectArmPose(arm, targetLocal, jawAngle) {
+  return findBestArmPose(arm, targetLocal, {
+    headAbs: arm.desiredHeadAbs,
+    jawAngle,
+  });
+}
+
+function getDirectArmState(arm) {
+  if (arm.directLimit) return 'arm limit';
+  if (pointerControl.active || wasPointerRecentlyActive()) return 'mouse';
+  if (isKeyboardArmActive()) return 'keyboard';
+  if (joypad.connected && joypad.active) return 'joypad';
+  if (joypad.jawOpen) return 'jaw open';
+  return joypad.connected ? 'pad ready' : 'direct';
+}
+
+function getCombinedHeadTurn() {
+  return joypad.headTurn + (keys.has('KeyQ') ? 1 : 0) + (keys.has('KeyE') ? -1 : 0);
+}
+
+function getPrecisionScale() {
+  return isPrecisionMode() ? 0.35 : 1;
+}
+
+function isPrecisionMode() {
+  return keys.has('ShiftLeft') || keys.has('ShiftRight');
+}
+
+function isKeyboardArmActive() {
+  return keys.has('KeyQ') || keys.has('KeyE');
+}
+
+function wasPointerRecentlyActive() {
+  return performance.now() - pointerControl.lastInputAt < 350;
 }
 
 function driveArmJoints(arm, pose) {
@@ -831,58 +882,48 @@ function driveArmJoint(arm, key, target, speedScale) {
   joint.setMotorSpeed(Math.abs(error) < 0.01 ? 0 : motorSpeed);
 }
 
-function findBestArmPose(arm, tipLocal, headLocal, options = {}) {
-  const candidates = findArmIKCandidates(arm, tipLocal, headLocal, options);
+function findBestArmPose(arm, wristLocal, options = {}) {
+  const candidates = findArmIKCandidates(arm, wristLocal, options);
   return candidates[0]?.pose ?? null;
 }
 
-function findArmIKCandidates(arm, tipLocal, headLocal, options = {}) {
-  const offsets = makeOrientationOffsets(options.orientationSlack ?? 0.2);
+function findArmIKCandidates(arm, wristLocal, options = {}) {
   const current = getArmJointAngles(arm);
   const candidates = [];
+  const desiredHeadAbs = options.headAbs ?? normalizeAngle(current.boomAngle + current.stickAngle + current.headAngle);
   const jawAngle = clamp(options.jawAngle ?? current.jawAngle ?? arm.jawClosedAngle, arm.limits.jawAngle[0], arm.limits.jawAngle[1]);
+  const dx = wristLocal.x - arm.baseLocal.x;
+  const dy = wristLocal.y - arm.baseLocal.y;
+  const l1 = arm.boomLength;
+  const l2 = arm.stickLength;
+  const distance = Math.hypot(dx, dy);
+  const minReach = Math.abs(l1 - l2) + 0.04;
+  const maxReach = l1 + l2 - 0.04;
+  if (distance < minReach || distance > maxReach) return candidates;
 
-  for (const orientationOffset of offsets) {
-    const headAbs = normalizeAngle(headLocal + orientationOffset);
-    const tipOffset = rotateVec(arm.headTipOffset, headAbs);
-    const wristTarget = Vec2(tipLocal.x - tipOffset.x, tipLocal.y - tipOffset.y);
-    const dx = wristTarget.x - arm.baseLocal.x;
-    const dy = wristTarget.y - arm.baseLocal.y;
-    const l1 = arm.boomLength;
-    const l2 = arm.stickLength;
-    const distance = Math.hypot(dx, dy);
-    const minReach = Math.abs(l1 - l2) + 0.04;
-    const maxReach = l1 + l2 - 0.04;
-    if (distance < minReach || distance > maxReach) continue;
-
-    const theta = Math.atan2(dy, dx);
-    const elbowMagnitude = Math.acos(clamp((distance * distance - l1 * l1 - l2 * l2) / (2 * l1 * l2), -1, 1));
-    for (const stickAngle of [elbowMagnitude, -elbowMagnitude]) {
-      const boomAngle = normalizeAngle(theta - Math.atan2(l2 * Math.sin(stickAngle), l1 + l2 * Math.cos(stickAngle)));
-      const headAngle = normalizeAngle(headAbs - boomAngle - stickAngle);
-      const pose = { boomAngle, stickAngle: normalizeAngle(stickAngle), headAngle, jawAngle };
-      if (!isArmPoseValid(arm, pose)) continue;
-      candidates.push({
-        pose,
-        score: scoreArmCandidate(arm, pose, current, headLocal, options),
-      });
-    }
+  const theta = Math.atan2(dy, dx);
+  const elbowMagnitude = Math.acos(clamp((distance * distance - l1 * l1 - l2 * l2) / (2 * l1 * l2), -1, 1));
+  for (const stickAngle of [elbowMagnitude, -elbowMagnitude]) {
+    const boomAngle = normalizeAngle(theta - Math.atan2(l2 * Math.sin(stickAngle), l1 + l2 * Math.cos(stickAngle)));
+    const stickAngleLocal = normalizeAngle(stickAngle);
+    const idealHeadAngle = normalizeAngle(desiredHeadAbs - boomAngle - stickAngleLocal);
+    const headAngle = clamp(idealHeadAngle, arm.limits.headAngle[0], arm.limits.headAngle[1]);
+    const pose = { boomAngle, stickAngle: stickAngleLocal, headAngle, jawAngle };
+    if (!isArmPoseValid(arm, pose)) continue;
+    candidates.push({
+      pose,
+      score: scoreArmCandidate(arm, pose, current, desiredHeadAbs),
+    });
   }
 
   candidates.sort((a, b) => a.score - b.score);
   return candidates;
 }
 
-function makeOrientationOffsets(slack) {
-  if (slack <= 0.01) return [0];
-  return [0, -slack * 0.45, slack * 0.45, -slack, slack];
-}
-
 function isArmPoseValid(arm, pose) {
   if (!isArmPoseWithinLimits(arm, pose, 0)) return false;
   const points = getArmLocalPointsForPose(arm, pose);
   if (points.wrist.x < -2.6 || points.tip.x < -2.8) return false;
-  if (Vec2.distance(points.tip, points.base) < 0.5) return false;
   if (Vec2.distance(points.wrist, points.base) < 0.42) return false;
   return true;
 }
@@ -893,14 +934,14 @@ function isArmPoseWithinLimits(arm, pose, margin = 0) {
   ));
 }
 
-function scoreArmCandidate(arm, pose, current, desiredHeadAbs, options) {
+function scoreArmCandidate(arm, pose, current, desiredHeadAbs) {
   const headAbs = normalizeAngle(pose.boomAngle + pose.stickAngle + pose.headAngle);
   const continuity =
     angleDelta(pose.boomAngle, current.boomAngle) * 1.1 +
     angleDelta(pose.stickAngle, current.stickAngle) * 0.85 +
     angleDelta(pose.headAngle, current.headAngle) * 0.42 +
     angleDelta(pose.jawAngle, current.jawAngle) * 0.18;
-  const orientation = angleDelta(headAbs, desiredHeadAbs) * (options.orientationWeight ?? 1);
+  const orientation = angleDelta(headAbs, desiredHeadAbs) * 0.9;
   const speed =
     Math.abs(arm.joints.boomAngle.getJointSpeed()) * 0.018 +
     Math.abs(arm.joints.stickAngle.getJointSpeed()) * 0.014 +
@@ -914,42 +955,16 @@ function scoreArmCandidate(arm, pose, current, desiredHeadAbs, options) {
   return continuity + orientation + speed + limitPenalty;
 }
 
-function worldAngleToChassisLocal(angle) {
-  return normalizeAngle(angle - tank.chassis.getAngle());
-}
-
-function isArmTargetReachable(arm, targetLocal) {
-  return [-0.95, -0.64, -0.32, 0.04].some((headLocal) => (
-    findArmIKCandidates(arm, targetLocal, headLocal, { jawAngle: jawOpenAngle, orientationSlack: 0.4 }).length > 0
-  ));
-}
-
-function isActionReachable(arm, action) {
-  return action.phases.every((phase) => {
-    if (phase.restPose) return true;
-    const targetLocal = phase.rest ? arm.restTipLocal : tank.chassis.getLocalPoint(phase.world);
-    const headLocal = phase.rest ? arm.restHeadAbs : worldAngleToChassisLocal(phase.headWorld);
-    return findArmIKCandidates(arm, targetLocal, headLocal, {
-      jawAngle: phase.jawAngle ?? arm.targetPose.jawAngle,
-      orientationSlack: 0.28,
-      orientationWeight: 1.2,
-    }).length > 0;
-  });
-}
-
 function sampleArmWorkspace(arm, step = 0.3) {
   const samples = [];
   const [boomMin, boomMax] = arm.limits.boomAngle;
   const [stickMin, stickMax] = arm.limits.stickAngle;
-  const [headMin, headMax] = arm.limits.headAngle;
 
   for (let boomAngle = boomMin; boomAngle <= boomMax; boomAngle += step) {
     for (let stickAngle = stickMin; stickAngle <= stickMax; stickAngle += step) {
-      for (let headAngle = headMin; headAngle <= headMax; headAngle += step) {
-        const pose = { boomAngle, stickAngle, headAngle, jawAngle: arm.jawClosedAngle };
-        if (isArmPoseValid(arm, pose)) {
-          samples.push(getArmLocalPointsForPose(arm, pose).tip);
-        }
+      const pose = { boomAngle, stickAngle, headAngle: arm.targetPose.headAngle, jawAngle: arm.jawClosedAngle };
+      if (isArmPoseValid(arm, pose)) {
+        samples.push(getArmLocalPointsForPose(arm, pose).wrist);
       }
     }
   }
@@ -957,28 +972,19 @@ function sampleArmWorkspace(arm, step = 0.3) {
   return samples;
 }
 
-function spawnSoil(targetWorld, amount) {
-  const count = clamp(Math.round(amount * 10), 3, 13);
-  for (let i = 0; i < count; i += 1) {
-    const body = world.createDynamicBody({
-      position: Vec2(
-        targetWorld.x + (Math.random() - 0.5) * 0.62,
-        targetWorld.y + 0.2 + Math.random() * 0.5,
-      ),
-      linearVelocity: Vec2((Math.random() - 0.5) * 1.8, -0.5 - Math.random() * 1.2),
-      angularVelocity: (Math.random() - 0.5) * 4,
-    });
-    body.setUserData({ kind: 'soil' });
-    body.createFixture(pl.Circle(0.08 + Math.random() * 0.07), {
-      density: 0.45,
-      friction: 0.9,
-      restitution: 0.02,
-    });
-  }
-}
-
-function offsetVec(v, x, y) {
-  return Vec2(v.x + x, v.y + y);
+function getWorkspaceBounds(samples) {
+  if (!samples.length) return null;
+  return samples.reduce((bounds, point) => ({
+    minX: Math.min(bounds.minX, point.x),
+    maxX: Math.max(bounds.maxX, point.x),
+    minY: Math.min(bounds.minY, point.y),
+    maxY: Math.max(bounds.maxY, point.y),
+  }), {
+    minX: Infinity,
+    maxX: -Infinity,
+    minY: Infinity,
+    maxY: -Infinity,
+  });
 }
 
 function rotateVec(v, angle) {
@@ -1025,10 +1031,96 @@ function frame(now) {
   requestAnimationFrame(frame);
 }
 
+function pollJoypad() {
+  if (!joypad.supported) {
+    joypad.active = false;
+    return;
+  }
+
+  const gamepad = getActiveGamepad();
+  if (!gamepad) {
+    joypad.connected = false;
+    joypad.index = null;
+    joypad.id = '';
+    joypad.drive = 0;
+    joypad.armX = 0;
+    joypad.armY = 0;
+    joypad.headTurn = 0;
+    joypad.active = false;
+    joypad.lastAButton = false;
+    return;
+  }
+
+  joypad.connected = true;
+  joypad.index = gamepad.index;
+  joypad.id = gamepad.id || 'Gamepad';
+
+  const leftX = applyStickDeadzone(gamepad.axes[0] ?? 0);
+  const rightX = applyStickDeadzone(gamepad.axes[2] ?? 0);
+  const rightY = applyStickDeadzone(gamepad.axes[3] ?? 0);
+  const aPressed = isGamepadButtonPressed(gamepad.buttons[0]);
+  const leftBumper = isGamepadButtonPressed(gamepad.buttons[4]);
+  const rightBumper = isGamepadButtonPressed(gamepad.buttons[5]);
+
+  if (aPressed && !joypad.lastAButton) {
+    joypad.jawOpen = !joypad.jawOpen;
+  }
+
+  joypad.lastAButton = aPressed;
+  joypad.drive = -leftX;
+  joypad.armX = rightX;
+  joypad.armY = -rightY;
+  joypad.headTurn = (leftBumper ? 1 : 0) + (rightBumper ? -1 : 0);
+  joypad.active = (
+    Math.abs(leftX) > 0 ||
+    Math.abs(rightX) > 0 ||
+    Math.abs(rightY) > 0 ||
+    aPressed ||
+    leftBumper ||
+    rightBumper
+  );
+
+  if (joypad.active) joypad.lastInputAt = performance.now();
+}
+
+function endPointerControl(event) {
+  if (!pointerControl.active) return;
+  pointerControl.active = false;
+  pointerControl.lastInputAt = performance.now();
+  if (event?.pointerId != null) {
+    canvas.releasePointerCapture?.(event.pointerId);
+  }
+  event?.preventDefault();
+}
+
+function getActiveGamepad() {
+  const gamepads = navigator.getGamepads?.();
+  if (!gamepads) return null;
+
+  if (joypad.index != null && gamepads[joypad.index]?.connected) {
+    return gamepads[joypad.index];
+  }
+
+  return Array.from(gamepads).find((gamepad) => gamepad?.connected) ?? null;
+}
+
+function isGamepadButtonPressed(button) {
+  return Boolean(button && (button.pressed || button.value > 0.5));
+}
+
+function applyStickDeadzone(value) {
+  const magnitude = Math.abs(value);
+  if (magnitude < gamepadDeadzone) return 0;
+  return Math.sign(value) * ((magnitude - gamepadDeadzone) / (1 - gamepadDeadzone));
+}
+
 function update(dt) {
-  desiredDrive = 0;
-  if (keys.has('KeyA')) desiredDrive += 1;
-  if (keys.has('KeyD')) desiredDrive -= 1;
+  pollJoypad();
+
+  let keyboardDrive = 0;
+  if (keys.has('KeyA')) keyboardDrive += 1;
+  if (keys.has('KeyD')) keyboardDrive -= 1;
+  desiredDrive = Math.abs(joypad.drive) > 0 ? joypad.drive : keyboardDrive;
 
   const targetSpeed = desiredDrive * settings.speed;
   const driveSign = Math.sign(targetSpeed);
@@ -1078,8 +1170,19 @@ function updateHud() {
   driveReadout.textContent = `${Math.min(100, pct)}%`;
   driveBar.style.transform = `scaleX(${Math.min(1, pct / 100)})`;
   const driveText = desiredDrive > 0 ? 'reverse' : desiredDrive < 0 ? 'forward' : 'idle';
-  const armText = tank?.arm?.state && tank.arm.state !== 'ready' ? tank.arm.state : driveText;
-  statusNode.textContent = paused ? 'paused' : armText;
+  const armText = tank?.arm?.state ?? (joypad.supported ? 'connect pad' : 'keyboard');
+
+  if (paused) {
+    statusNode.textContent = 'paused';
+  } else if (armText === 'arm limit') {
+    statusNode.textContent = armText;
+  } else if (armText !== 'direct' || joypad.connected) {
+    statusNode.textContent = armText;
+  } else if (driveText !== 'idle') {
+    statusNode.textContent = driveText;
+  } else {
+    statusNode.textContent = armText;
+  }
 }
 
 function updatePauseButton() {
@@ -1114,17 +1217,6 @@ function worldToScreen(v) {
     x: (v.x - camera.x) * camera.zoom + canvas.clientWidth * 0.5 + sidebarOffset,
     y: (camera.y - v.y) * camera.zoom + canvas.clientHeight * 0.52,
   };
-}
-
-function screenToWorld(clientX, clientY) {
-  const rect = canvas.getBoundingClientRect();
-  const sidebarOffset = window.innerWidth > 860 ? -128 : 0;
-  const x = clientX - rect.left;
-  const y = clientY - rect.top;
-  return Vec2(
-    (x - canvas.clientWidth * 0.5 - sidebarOffset) / camera.zoom + camera.x,
-    camera.y - (y - canvas.clientHeight * 0.52) / camera.zoom,
-  );
 }
 
 function render() {
@@ -1203,7 +1295,6 @@ function drawTank() {
   drawExcavatorBoom();
   drawChassis();
   drawExcavatorHeadTop();
-  drawJawLoad(getArmLocalPoints(tank.arm));
   drawExcavatorJawBottom();
   drawArmTarget();
 }
@@ -1412,22 +1503,6 @@ function drawJoint(local, radius) {
   ctx.stroke();
 }
 
-function drawJawLoad(points) {
-  const arm = tank.arm;
-  if (arm.load <= 0.02) return;
-
-  const loadVerts = [
-    Vec2(arm.headLength * 0.46, -0.32),
-    Vec2(arm.headLength * 0.77, -0.34),
-    Vec2(arm.headLength * 0.86, -0.72),
-    Vec2(arm.headLength * 0.54, -0.84),
-  ].map((point) => localPartPoint(points.wrist, points.headAbs, point));
-
-  ctx.fillStyle = '#6d5131';
-  traceLocalPolygon(loadVerts);
-  ctx.fill();
-}
-
 function drawSvgBodyBetweenPivots(body, imageAsset, svg) {
   const anchor = segmentCenter(svg.pivot, svg.end);
   const angle = body.getAngle() - svgPivotAngle(svg.pivot, svg.end);
@@ -1452,11 +1527,12 @@ function drawSvgAtAnchor(imageAsset, anchorWorld, angle, anchorSvg, scale) {
 
 function drawArmTarget() {
   const arm = tank.arm;
-  if (!arm.targetWorld || arm.targetFlash <= 0) return;
+  if (!arm.directTargetLocal) return;
+  arm.targetWorld = arm.chassis.getWorldPoint(arm.directTargetLocal);
   const point = worldToScreen(arm.targetWorld);
-  const radius = (0.22 + arm.targetFlash * 0.2) * camera.zoom;
+  const radius = 0.2 * camera.zoom;
   ctx.save();
-  ctx.strokeStyle = arm.state === 'out of range' ? '#bb2f2f' : '#d3952c';
+  ctx.strokeStyle = arm.directLimit ? '#bb2f2f' : '#d3952c';
   ctx.lineWidth = 2;
   ctx.beginPath();
   ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
@@ -1472,25 +1548,6 @@ function localToScreen(local) {
 
 function offsetLocal(point, x, y) {
   return Vec2(point.x + x, point.y + y);
-}
-
-function localPartPoint(origin, angle, point) {
-  const c = Math.cos(angle);
-  const s = Math.sin(angle);
-  return Vec2(
-    origin.x + point.x * c - point.y * s,
-    origin.y + point.x * s + point.y * c,
-  );
-}
-
-function traceLocalPolygon(vertices) {
-  ctx.beginPath();
-  vertices.forEach((vertex, index) => {
-    const point = localToScreen(vertex);
-    if (index === 0) ctx.moveTo(point.x, point.y);
-    else ctx.lineTo(point.x, point.y);
-  });
-  ctx.closePath();
 }
 
 function drawLocalLine(a, b) {
