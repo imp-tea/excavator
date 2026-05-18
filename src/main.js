@@ -83,6 +83,16 @@ const settings = {
 const gamepadDeadzone = 0.14;
 const directTargetSpeed = 4.1;
 const directHeadTurnSpeed = 1.35;
+const facingRight = 1;
+const facingLeft = -1;
+const flipStatusDuration = 900;
+const flipStopThresholds = {
+  linear: 0.22,
+  angular: 0.32,
+  wheel: 0.9,
+  motor: 0.35,
+  arm: 0.8,
+};
 
 const sliderSpecs = [
   ['speed', 'Drive speed', 4, 24, 0.5],
@@ -115,6 +125,7 @@ const joypad = {
   headTurn: 0,
   jawOpen: false,
   lastAButton: false,
+  lastYButton: false,
   active: false,
   lastInputAt: 0,
 };
@@ -128,6 +139,8 @@ let lastTime = performance.now();
 let accumulator = 0;
 let paused = false;
 let resetQueued = false;
+let flipStatusMessage = '';
+let flipStatusUntil = 0;
 
 setupControls();
 buildWorld();
@@ -139,6 +152,10 @@ window.addEventListener('keydown', (event) => {
   if (event.repeat) return;
   if (event.code === 'KeyA' || event.code === 'KeyD' || event.code === 'KeyQ' || event.code === 'KeyE' || event.code === 'ShiftLeft' || event.code === 'ShiftRight') {
     keys.add(event.code);
+    event.preventDefault();
+  }
+  if (event.code === 'KeyR') {
+    requestFacingFlip();
     event.preventDefault();
   }
   if (event.code === 'Space') {
@@ -210,6 +227,7 @@ window.addEventListener('gamepaddisconnected', (event) => {
     joypad.headTurn = 0;
     joypad.active = false;
     joypad.lastAButton = false;
+    joypad.lastYButton = false;
     updateHud();
   }
 });
@@ -281,10 +299,12 @@ function buildWorld() {
   world.setWarmStarting(true);
   world.setContinuousPhysics(true);
   sharedWheelSpeed = 0;
+  flipStatusMessage = '';
+  flipStatusUntil = 0;
 
   createTerrain();
   createProps();
-  tank = createTank(Vec2(-14, 4.6));
+  tank = createTank(Vec2(-14, 4.6), facingRight);
 }
 
 function createTerrain() {
@@ -359,43 +379,45 @@ function createProps() {
   }
 }
 
-function createTank(position) {
+function createTank(position, facing = facingRight, state = {}) {
+  const direction = facing === facingLeft ? facingLeft : facingRight;
   const chassis = world.createDynamicBody({
     type: 'dynamic',
     position,
+    angle: state.angle ?? 0,
     angularDamping: 0.85,
     linearDamping: 0.12,
     bullet: true,
   });
 
-  chassis.createFixture(pl.Polygon([
+  chassis.createFixture(pl.Polygon(mirrorFixtureVertices([
     Vec2(-2.72, -0.5),
     Vec2(-2.24, -0.82),
     Vec2(2.36, -0.82),
     Vec2(2.82, -0.5),
     Vec2(2.58, 0.58),
     Vec2(-2.52, 0.64),
-  ]), {
+  ], direction)), {
     density: settings.chassisMass,
     friction: 0.7,
     restitution: 0,
     filterGroupIndex: collision.tank,
   });
-  chassis.createFixture(pl.Polygon([
+  chassis.createFixture(pl.Polygon(mirrorFixtureVertices([
     Vec2(-2.1, 0.52),
     Vec2(2.25, 0.5),
     Vec2(2.38, 1.18),
     Vec2(1.2, 2.74),
     Vec2(-0.8, 3.16),
     Vec2(-2.06, 1.46),
-  ]), {
+  ], direction)), {
     density: settings.chassisMass * 0.16,
     friction: 0.7,
     restitution: 0,
     filterGroupIndex: collision.tank,
   });
 
-  const localWheelPoints = makeTreadLoop();
+  const localWheelPoints = makeTreadLoop(direction);
   const wheels = [];
   const wheelJoints = [];
   const linkJoints = [];
@@ -439,45 +461,43 @@ function createTank(position) {
   }
 
   return {
+    facing: direction,
     chassis,
     wheels,
     wheelJoints,
     linkJoints,
-    arm: createExcavatorArm(chassis),
-    tail: createExcavatorTail(chassis),
-    chassisArtPivotLocal: Vec2(0.52, 2.78),
+    arm: createExcavatorArm(chassis, direction, state.arm),
+    tail: createExcavatorTail(chassis, direction, state.tail),
+    chassisArtPivotLocal: Vec2(0.52 * direction, 2.78),
     radius,
-    drivePhase: 0,
+    drivePhase: state.drivePhase ?? 0,
   };
 }
 
-function createExcavatorArm(chassis) {
+function createExcavatorArm(chassis, facing = facingRight, state = {}) {
   const boomLength = svgDistance(excavatorSvg.boom.pivot, excavatorSvg.boom.end) * excavatorArtScale;
   const stickLength = svgDistance(excavatorSvg.stick.pivot, excavatorSvg.stick.end) * excavatorArtScale;
   const headLength = (excavatorSvg.headTop.viewBox.width - excavatorSvg.headTop.pivot.x - 18) * headJawArtScale;
-  const targetPose = {
+  const targetPose = state?.targetPose ?? orientArmPoseForFacing({
     boomAngle: 1.05,
     stickAngle: -1.22,
     headAngle: -0.5,
     jawAngle: jawClosedAngle,
-  };
+  }, facing);
   const arm = {
     chassis,
-    baseLocal: Vec2(0.97, 2.33),
+    facing,
+    baseLocal: Vec2(0.97 * facing, 2.33),
     boomLength,
     stickLength,
     headLength,
-    headTipOffset: Vec2(headLength * 0.9, -0.56),
+    headTipOffset: Vec2(headLength * 0.9 * facing, -0.56),
     boomWidth: 0.42,
     stickWidth: 0.4,
-    jawOpenAngle,
-    jawClosedAngle,
-    limits: {
-      boomAngle: [-0.65, 2.05],
-      stickAngle: [-2.72, 1.42],
-      headAngle: [-1.45, 1.05],
-      jawAngle: [-0.58, 0.28],
-    },
+    jawOpenAngle: jawOpenAngle * facing,
+    jawClosedAngle: jawClosedAngle * facing,
+    forwardLimits: createArmLimits(facingRight),
+    limits: createArmLimits(facing),
     motorTorque: {
       boomAngle: 640,
       stickAngle: 520,
@@ -511,8 +531,8 @@ function createExcavatorArm(chassis) {
     0.16,
     'stick',
   );
-  const headTopBody = createHeadBody(chassis, initialPoints.wrist, initialPoints.headAbs);
-  const jawBottomBody = createJawBody(chassis, initialPoints.wrist, initialPoints.headAbs + arm.targetPose.jawAngle);
+  const headTopBody = createHeadBody(chassis, initialPoints.wrist, initialPoints.headAbs, facing, headLength);
+  const jawBottomBody = createJawBody(chassis, initialPoints.wrist, initialPoints.headAbs + arm.targetPose.jawAngle, facing, headLength);
 
   arm.bodies = {
     boom: boomBody,
@@ -530,20 +550,48 @@ function createExcavatorArm(chassis) {
 
   arm.workspaceSample = sampleArmWorkspace(arm, 0.05);
   arm.workspaceBounds = getWorkspaceBounds(arm.workspaceSample);
-  arm.directTargetLocal = Vec2(initialPoints.wrist.x, initialPoints.wrist.y);
-  arm.desiredHeadAbs = initialPoints.headAbs;
+  arm.directTargetLocal = state?.directTargetLocal
+    ? Vec2(state.directTargetLocal.x, state.directTargetLocal.y)
+    : Vec2(initialPoints.wrist.x, initialPoints.wrist.y);
+  arm.desiredHeadAbs = state?.desiredHeadAbs ?? initialPoints.headAbs;
   arm.targetWorld = chassis.getWorldPoint(arm.directTargetLocal);
 
   return arm;
 }
 
-function createExcavatorTail(chassis) {
+function createArmLimits(facing) {
+  const limits = {
+    boomAngle: [-0.65, 2.05],
+    stickAngle: [-2.72, 1.42],
+    headAngle: [-1.45, 1.05],
+    jawAngle: [-0.58, 0.28],
+  };
+
+  if (facing === facingRight) return limits;
+
+  return Object.fromEntries(Object.entries(limits).map(([key, [min, max]]) => [
+    key,
+    [-max, -min],
+  ]));
+}
+
+function orientArmPoseForFacing(pose, facing) {
+  return {
+    boomAngle: pose.boomAngle * facing,
+    stickAngle: pose.stickAngle * facing,
+    headAngle: pose.headAngle * facing,
+    jawAngle: pose.jawAngle * facing,
+  };
+}
+
+function createExcavatorTail(chassis, facing = facingRight, state = {}) {
   return {
     chassis,
-    localPivot: Vec2(-1.84, 0.72),
+    facing,
+    localPivot: Vec2(-1.84 * facing, 0.72),
     baseAngle: -Math.PI / 4,
-    offset: 0,
-    velocity: 0,
+    offset: state?.offset ?? 0,
+    velocity: state?.velocity ?? 0,
   };
 }
 
@@ -565,7 +613,7 @@ function createArmSegmentBody(chassis, centerLocal, angleLocal, length, width, d
   return body;
 }
 
-function createHeadBody(chassis, wristLocal, angleLocal) {
+function createHeadBody(chassis, wristLocal, angleLocal, facing, headLength) {
   const body = world.createDynamicBody({
     position: chassis.getWorldPoint(wristLocal),
     angle: chassis.getAngle() + angleLocal,
@@ -574,7 +622,7 @@ function createHeadBody(chassis, wristLocal, angleLocal) {
     bullet: true,
   });
   body.setUserData({ kind: 'arm', part: 'headTop' });
-  body.createFixture(pl.Polygon(getHeadTopLocalVertices()), {
+  body.createFixture(pl.Polygon(getHeadTopLocalVertices(headLength, facing)), {
     density: 0.06,
     friction: 0.92,
     restitution: 0.01,
@@ -583,7 +631,7 @@ function createHeadBody(chassis, wristLocal, angleLocal) {
   return body;
 }
 
-function createJawBody(chassis, wristLocal, angleLocal) {
+function createJawBody(chassis, wristLocal, angleLocal, facing, headLength) {
   const body = world.createDynamicBody({
     position: chassis.getWorldPoint(wristLocal),
     angle: chassis.getAngle() + angleLocal,
@@ -592,7 +640,7 @@ function createJawBody(chassis, wristLocal, angleLocal) {
     bullet: true,
   });
   body.setUserData({ kind: 'arm', part: 'jawBottom' });
-  body.createFixture(pl.Polygon(getJawBottomLocalVertices()), {
+  body.createFixture(pl.Polygon(getJawBottomLocalVertices(headLength, facing)), {
     density: 0.054,
     friction: 0.95,
     restitution: 0.01,
@@ -601,28 +649,26 @@ function createJawBody(chassis, wristLocal, angleLocal) {
   return body;
 }
 
-function getHeadTopLocalVertices() {
-  const length = tank?.arm?.headLength ?? (excavatorSvg.headTop.viewBox.width - excavatorSvg.headTop.pivot.x - 18) * headJawArtScale;
-  return [
+function getHeadTopLocalVertices(length = (excavatorSvg.headTop.viewBox.width - excavatorSvg.headTop.pivot.x - 18) * headJawArtScale, facing = facingRight) {
+  return mirrorFixtureVertices([
     Vec2(-0.06, -0.24),
     Vec2(0.38, 0.92),
     Vec2(length * 0.58, 1.18),
     Vec2(length, 0.44),
     Vec2(length * 0.95, -0.22),
     Vec2(0.42, -0.44),
-  ];
+  ], facing);
 }
 
-function getJawBottomLocalVertices() {
-  const length = tank?.arm?.headLength ?? (excavatorSvg.headTop.viewBox.width - excavatorSvg.headTop.pivot.x - 18) * headJawArtScale;
-  return [
+function getJawBottomLocalVertices(length = (excavatorSvg.headTop.viewBox.width - excavatorSvg.headTop.pivot.x - 18) * headJawArtScale, facing = facingRight) {
+  return mirrorFixtureVertices([
     Vec2(-0.05, 0.12),
     Vec2(0.58, 0.22),
     Vec2(length, -0.42),
     Vec2(length * 0.92, -1.3),
     Vec2(0.48, -1.12),
     Vec2(-0.08, -0.16),
-  ];
+  ], facing);
 }
 
 function createArmJoint(parent, child, anchorWorld, limits, maxMotorTorque) {
@@ -651,35 +697,41 @@ function svgPivotAngle(a, b) {
   return Math.atan2(-(b.y - a.y), b.x - a.x);
 }
 
-function makeTreadLoop() {
+function makeTreadLoop(facing = facingRight) {
   const points = [];
   const halfLength = 2.45;
   const topY = -0.34;
   const bottomY = -1.16;
   const endRadius = (topY - bottomY) * 0.5;
   const centerY = (topY + bottomY) * 0.5;
+  const localPoint = (x, y) => Vec2(x * facing, y);
 
   for (let i = 0; i < 7; i += 1) {
     const t = i / 6;
-    points.push(Vec2(-halfLength + t * halfLength * 2, bottomY));
+    points.push(localPoint(-halfLength + t * halfLength * 2, bottomY));
   }
 
   for (let i = 2; i <= 4; i += 2) {
     const theta = -Math.PI / 2 + (i / 5) * Math.PI;
-    points.push(Vec2(halfLength + Math.cos(theta) * endRadius, centerY + Math.sin(theta) * endRadius));
+    points.push(localPoint(halfLength + Math.cos(theta) * endRadius, centerY + Math.sin(theta) * endRadius));
   }
 
   for (let i = 1; i < 7; i += 1) {
     const t = i / 6;
-    points.push(Vec2(halfLength - t * halfLength * 2, topY));
+    points.push(localPoint(halfLength - t * halfLength * 2, topY));
   }
 
   for (let i = 2; i <= 4; i += 2) {
     const theta = Math.PI / 2 + (i / 5) * Math.PI;
-    points.push(Vec2(-halfLength + Math.cos(theta) * endRadius, centerY + Math.sin(theta) * endRadius));
+    points.push(localPoint(-halfLength + Math.cos(theta) * endRadius, centerY + Math.sin(theta) * endRadius));
   }
 
   return points;
+}
+
+function mirrorFixtureVertices(vertices, facing) {
+  if (facing === facingRight) return vertices;
+  return vertices.map((vertex) => Vec2(vertex.x * facing, vertex.y)).reverse();
 }
 
 function applyLiveSettings(key) {
@@ -717,6 +769,100 @@ function applyLiveSettings(key) {
   if (key === 'chassisMass') {
     resetQueued = true;
   }
+}
+
+function requestFacingFlip() {
+  if (!tank) return false;
+
+  if (!isTankStoppedForFlip()) {
+    showFlipStatus('stop to flip');
+    return false;
+  }
+
+  flipTankFacing();
+  showFlipStatus(tank.facing === facingLeft ? 'facing left' : 'facing right');
+  return true;
+}
+
+function isTankStoppedForFlip() {
+  const velocity = tank.chassis.getLinearVelocity();
+  const chassisSpeed = Math.hypot(velocity.x, velocity.y);
+  const wheelSpeed = Math.max(...tank.wheels.map((wheel) => Math.abs(wheel.body.getAngularVelocity())));
+  const armSpeed = Math.max(...Object.values(tank.arm.joints).map((joint) => Math.abs(joint.getJointSpeed())));
+
+  return (
+    chassisSpeed < flipStopThresholds.linear &&
+    Math.abs(tank.chassis.getAngularVelocity()) < flipStopThresholds.angular &&
+    wheelSpeed < flipStopThresholds.wheel &&
+    Math.abs(sharedWheelSpeed) < flipStopThresholds.motor &&
+    armSpeed < flipStopThresholds.arm
+  );
+}
+
+function flipTankFacing() {
+  const previous = tank;
+  const currentPosition = previous.chassis.getPosition();
+  const position = Vec2(currentPosition.x, currentPosition.y);
+  const nextState = {
+    angle: previous.chassis.getAngle(),
+    drivePhase: previous.drivePhase,
+    arm: captureFlippedArmState(previous.arm),
+    tail: {
+      offset: previous.tail.offset,
+      velocity: 0,
+    },
+  };
+
+  destroyTank(previous);
+  tank = createTank(position, -previous.facing, nextState);
+  sharedWheelSpeed = 0;
+  desiredDrive = 0;
+  pointerControl.deltaLocal = Vec2(0, 0);
+}
+
+function captureFlippedArmState(arm) {
+  const points = getArmLocalPoints(arm);
+  const directTargetLocal = arm.directTargetLocal ?? points.wrist;
+  const desiredHeadAbs = arm.desiredHeadAbs ?? points.headAbs;
+
+  return {
+    targetPose: flipArmPose(getArmJointAngles(arm)),
+    directTargetLocal: Vec2(-directTargetLocal.x, directTargetLocal.y),
+    desiredHeadAbs: -desiredHeadAbs,
+  };
+}
+
+function flipArmPose(pose) {
+  return {
+    boomAngle: -pose.boomAngle,
+    stickAngle: -pose.stickAngle,
+    headAngle: -pose.headAngle,
+    jawAngle: -pose.jawAngle,
+  };
+}
+
+function destroyTank(current) {
+  [
+    ...Object.values(current.arm.joints),
+    ...current.wheelJoints,
+    ...current.linkJoints,
+  ].forEach((joint) => {
+    if (joint) world.destroyJoint(joint);
+  });
+
+  [
+    ...Object.values(current.arm.bodies),
+    ...current.wheels.map((wheel) => wheel.body),
+    current.chassis,
+  ].forEach((body) => {
+    if (body) world.destroyBody(body);
+  });
+}
+
+function showFlipStatus(message) {
+  flipStatusMessage = message;
+  flipStatusUntil = performance.now() + flipStatusDuration;
+  updateHud();
 }
 
 function updateArm(dt) {
@@ -891,8 +1037,13 @@ function findArmIKCandidates(arm, wristLocal, options = {}) {
   const current = getArmJointAngles(arm);
   const candidates = [];
   const desiredHeadAbs = options.headAbs ?? normalizeAngle(current.boomAngle + current.stickAngle + current.headAngle);
-  const jawAngle = clamp(options.jawAngle ?? current.jawAngle ?? arm.jawClosedAngle, arm.limits.jawAngle[0], arm.limits.jawAngle[1]);
-  const dx = wristLocal.x - arm.baseLocal.x;
+  const desiredHeadForward = normalizeAngle(desiredHeadAbs * arm.facing);
+  const jawAngleForward = clamp(
+    (options.jawAngle ?? current.jawAngle ?? arm.jawClosedAngle) * arm.facing,
+    arm.forwardLimits.jawAngle[0],
+    arm.forwardLimits.jawAngle[1],
+  );
+  const dx = (wristLocal.x - arm.baseLocal.x) * arm.facing;
   const dy = wristLocal.y - arm.baseLocal.y;
   const l1 = arm.boomLength;
   const l2 = arm.stickLength;
@@ -906,9 +1057,14 @@ function findArmIKCandidates(arm, wristLocal, options = {}) {
   for (const stickAngle of [elbowMagnitude, -elbowMagnitude]) {
     const boomAngle = normalizeAngle(theta - Math.atan2(l2 * Math.sin(stickAngle), l1 + l2 * Math.cos(stickAngle)));
     const stickAngleLocal = normalizeAngle(stickAngle);
-    const idealHeadAngle = normalizeAngle(desiredHeadAbs - boomAngle - stickAngleLocal);
-    const headAngle = clamp(idealHeadAngle, arm.limits.headAngle[0], arm.limits.headAngle[1]);
-    const pose = { boomAngle, stickAngle: stickAngleLocal, headAngle, jawAngle };
+    const idealHeadAngle = normalizeAngle(desiredHeadForward - boomAngle - stickAngleLocal);
+    const headAngle = clamp(idealHeadAngle, arm.forwardLimits.headAngle[0], arm.forwardLimits.headAngle[1]);
+    const pose = orientArmPoseForFacing({
+      boomAngle,
+      stickAngle: stickAngleLocal,
+      headAngle,
+      jawAngle: jawAngleForward,
+    }, arm.facing);
     if (!isArmPoseValid(arm, pose)) continue;
     candidates.push({
       pose,
@@ -923,7 +1079,7 @@ function findArmIKCandidates(arm, wristLocal, options = {}) {
 function isArmPoseValid(arm, pose) {
   if (!isArmPoseWithinLimits(arm, pose, 0)) return false;
   const points = getArmLocalPointsForPose(arm, pose);
-  if (points.wrist.x < -2.6 || points.tip.x < -2.8) return false;
+  if (points.wrist.x * arm.facing < -2.6 || points.tip.x * arm.facing < -2.8) return false;
   if (Vec2.distance(points.wrist, points.base) < 0.42) return false;
   return true;
 }
@@ -1048,6 +1204,7 @@ function pollJoypad() {
     joypad.headTurn = 0;
     joypad.active = false;
     joypad.lastAButton = false;
+    joypad.lastYButton = false;
     return;
   }
 
@@ -1059,14 +1216,19 @@ function pollJoypad() {
   const rightX = applyStickDeadzone(gamepad.axes[2] ?? 0);
   const rightY = applyStickDeadzone(gamepad.axes[3] ?? 0);
   const aPressed = isGamepadButtonPressed(gamepad.buttons[0]);
+  const yPressed = isGamepadButtonPressed(gamepad.buttons[3]);
   const leftBumper = isGamepadButtonPressed(gamepad.buttons[4]);
   const rightBumper = isGamepadButtonPressed(gamepad.buttons[5]);
 
   if (aPressed && !joypad.lastAButton) {
     joypad.jawOpen = !joypad.jawOpen;
   }
+  if (yPressed && !joypad.lastYButton) {
+    requestFacingFlip();
+  }
 
   joypad.lastAButton = aPressed;
+  joypad.lastYButton = yPressed;
   joypad.drive = -leftX;
   joypad.armX = rightX;
   joypad.armY = -rightY;
@@ -1076,6 +1238,7 @@ function pollJoypad() {
     Math.abs(rightX) > 0 ||
     Math.abs(rightY) > 0 ||
     aPressed ||
+    yPressed ||
     leftBumper ||
     rightBumper
   );
@@ -1172,7 +1335,9 @@ function updateHud() {
   const driveText = desiredDrive > 0 ? 'reverse' : desiredDrive < 0 ? 'forward' : 'idle';
   const armText = tank?.arm?.state ?? (joypad.supported ? 'connect pad' : 'keyboard');
 
-  if (paused) {
+  if (performance.now() < flipStatusUntil && flipStatusMessage) {
+    statusNode.textContent = flipStatusMessage;
+  } else if (paused) {
     statusNode.textContent = 'paused';
   } else if (armText === 'arm limit') {
     statusNode.textContent = armText;
@@ -1355,18 +1520,21 @@ function drawChassis() {
     tank.chassis.getAngle(),
     excavatorSvg.chassis.pivot,
     excavatorArtScale,
+    tank.facing,
   );
   ctx.restore();
 }
 
 function drawExcavatorTail() {
   const tail = tank.tail;
+  const localAngle = tail.baseAngle + tail.offset;
   drawSvgAtAnchor(
     excavatorImages.tail,
     tank.chassis.getWorldPoint(tail.localPivot),
-    tank.chassis.getAngle() + tail.baseAngle + tail.offset,
+    tank.chassis.getAngle() + localAngle * tank.facing,
     excavatorSvg.tail.pivot,
     excavatorArtScale,
+    tank.facing,
   );
 }
 
@@ -1375,28 +1543,28 @@ function drawExcavatorBoom() {
   const points = getArmLocalPoints(arm);
   ctx.save();
   drawHydraulics(points);
-  drawSvgBodyBetweenPivots(arm.bodies.boom, excavatorImages.boom, excavatorSvg.boom);
+  drawSvgBodyBetweenPivots(arm.bodies.boom, excavatorImages.boom, excavatorSvg.boom, arm.facing);
   ctx.restore();
 }
 
 function drawExcavatorStick() {
   const arm = tank.arm;
   ctx.save();
-  drawSvgBodyBetweenPivots(arm.bodies.stick, excavatorImages.stick, excavatorSvg.stick);
+  drawSvgBodyBetweenPivots(arm.bodies.stick, excavatorImages.stick, excavatorSvg.stick, arm.facing);
   ctx.restore();
 }
 
 function drawExcavatorHeadTop() {
   const arm = tank.arm;
   ctx.save();
-  drawSvgBodyAtPivot(arm.bodies.headTop, excavatorImages.headTop, excavatorSvg.headTop, headJawArtScale);
+  drawSvgBodyAtPivot(arm.bodies.headTop, excavatorImages.headTop, excavatorSvg.headTop, headJawArtScale, arm.facing);
   ctx.restore();
 }
 
 function drawExcavatorJawBottom() {
   const arm = tank.arm;
   ctx.save();
-  drawSvgBodyAtPivot(arm.bodies.jawBottom, excavatorImages.jawBottom, excavatorSvg.jawBottom, headJawArtScale);
+  drawSvgBodyAtPivot(arm.bodies.jawBottom, excavatorImages.jawBottom, excavatorSvg.jawBottom, headJawArtScale, arm.facing);
   ctx.restore();
 }
 
@@ -1418,8 +1586,8 @@ function getArmLocalPoints(arm) {
 function getArmWorldPoints(arm) {
   return {
     base: arm.chassis.getWorldPoint(arm.baseLocal),
-    elbow: arm.bodies.boom.getWorldPoint(Vec2(arm.boomLength * 0.5, 0)),
-    wrist: arm.bodies.stick.getWorldPoint(Vec2(arm.stickLength * 0.5, 0)),
+    elbow: arm.bodies.boom.getWorldPoint(Vec2(arm.boomLength * 0.5 * arm.facing, 0)),
+    wrist: arm.bodies.stick.getWorldPoint(Vec2(arm.stickLength * 0.5 * arm.facing, 0)),
     tip: arm.bodies.headTop.getWorldPoint(arm.headTipOffset),
   };
 }
@@ -1430,12 +1598,12 @@ function getArmLocalPointsForPose(arm, pose) {
   const headAbs = stickAbs + pose.headAngle;
   const base = Vec2(arm.baseLocal.x, arm.baseLocal.y);
   const elbow = Vec2(
-    base.x + Math.cos(boomAbs) * arm.boomLength,
-    base.y + Math.sin(boomAbs) * arm.boomLength,
+    base.x + Math.cos(boomAbs) * arm.boomLength * arm.facing,
+    base.y + Math.sin(boomAbs) * arm.boomLength * arm.facing,
   );
   const wrist = Vec2(
-    elbow.x + Math.cos(stickAbs) * arm.stickLength,
-    elbow.y + Math.sin(stickAbs) * arm.stickLength,
+    elbow.x + Math.cos(stickAbs) * arm.stickLength * arm.facing,
+    elbow.y + Math.sin(stickAbs) * arm.stickLength * arm.facing,
   );
   const tipOffset = rotateVec(arm.headTipOffset, headAbs);
   const tip = Vec2(
@@ -1503,24 +1671,25 @@ function drawJoint(local, radius) {
   ctx.stroke();
 }
 
-function drawSvgBodyBetweenPivots(body, imageAsset, svg) {
+function drawSvgBodyBetweenPivots(body, imageAsset, svg, facing = facingRight) {
   const anchor = segmentCenter(svg.pivot, svg.end);
-  const angle = body.getAngle() - svgPivotAngle(svg.pivot, svg.end);
-  drawSvgAtAnchor(imageAsset, body.getPosition(), angle, anchor, excavatorArtScale);
+  const assetAngle = svgPivotAngle(svg.pivot, svg.end);
+  const angle = facing === facingRight ? body.getAngle() - assetAngle : body.getAngle() + assetAngle;
+  drawSvgAtAnchor(imageAsset, body.getPosition(), angle, anchor, excavatorArtScale, facing);
 }
 
-function drawSvgBodyAtPivot(body, imageAsset, svg, scale = excavatorArtScale) {
-  drawSvgAtAnchor(imageAsset, body.getPosition(), body.getAngle(), svg.pivot, scale);
+function drawSvgBodyAtPivot(body, imageAsset, svg, scale = excavatorArtScale, facing = facingRight) {
+  drawSvgAtAnchor(imageAsset, body.getPosition(), body.getAngle(), svg.pivot, scale, facing);
 }
 
-function drawSvgAtAnchor(imageAsset, anchorWorld, angle, anchorSvg, scale) {
+function drawSvgAtAnchor(imageAsset, anchorWorld, angle, anchorSvg, scale, scaleXSign = facingRight) {
   if (!imageAsset.loaded) return;
 
   const anchor = worldToScreen(anchorWorld);
   ctx.save();
   ctx.translate(anchor.x, anchor.y);
   ctx.rotate(-angle);
-  ctx.scale(camera.zoom * scale, camera.zoom * scale);
+  ctx.scale(camera.zoom * scale * scaleXSign, camera.zoom * scale);
   ctx.drawImage(imageAsset.image, -anchorSvg.x, -anchorSvg.y);
   ctx.restore();
 }
@@ -1547,7 +1716,7 @@ function localToScreen(local) {
 }
 
 function offsetLocal(point, x, y) {
-  return Vec2(point.x + x, point.y + y);
+  return Vec2(point.x + x * tank.facing, point.y + y);
 }
 
 function drawLocalLine(a, b) {
